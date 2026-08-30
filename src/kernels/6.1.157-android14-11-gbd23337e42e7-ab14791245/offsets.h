@@ -13,8 +13,8 @@ OFFSETS_ENTRY(
     .off_init_task = 0x0201f640,
     .off_init_cred = 0x02031aa8,
     .off_root_task_group = 0x02208580,
-    .off_slide_boot_id = 0x0227b498,
-
+    .off_slide_boot_id = 0x0227b498, 
+),
 /* BTF reference (runtime uses target.h defaults): */
 /* #define STRUCT_PAGE_SIZE 0x40 */
 /* #define STRUCT_PAGE_COMPOUND_HEAD 0x8 */
