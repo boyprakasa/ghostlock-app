@@ -3,7 +3,8 @@
 
 #include <stdint.h>
 
-struct kernel_offsets {
+struct kernel_offsets
+{
   const char *uname_r;
   /* Bootloader-selected physical load address; 0 uses target.h. */
   uint64_t kernel_phys_load;
@@ -28,7 +29,7 @@ struct kernel_offsets {
   uint32_t _pad[3];
 };
 
-#define OFFSETS_ENTRY(uname, ...) { .uname_r = uname, __VA_ARGS__ }
+#define OFFSETS_ENTRY(uname, ...) {.uname_r = uname, __VA_ARGS__}
 
 #define STRUCT_OFFSETS_6_1                                                     \
   .task_prio = 0x84, .task_normal_prio = 0x8C, .task_sched_task_group = 0x348, \
@@ -91,7 +92,6 @@ static const struct kernel_offsets known_offsets[] = {
 #include "6.12.23-android16-5-gf1bdb13583da-ab13761046-4k/offsets.h"
 #include "6.12.30-android16-5-g6e872b4863d6-ab13847919-4k/offsets.h"
 #include "6.12.38-android16-5-g844001fb8721-ab14552068-4k/offsets.h"
-  { .uname_r = NULL }
-};
+    {.uname_r = NULL}};
 
 #endif
