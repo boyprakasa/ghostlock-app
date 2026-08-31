@@ -8,7 +8,7 @@ OFFSETS_ENTRY(
     .off_init_task = 0x0201F640,
     .off_init_cred = 0x02031AA8,
     .off_root_task_group = 0x02208580,
-    .off_selinux_enforcing = 0x01FCA8C0,
+    .off_selinux_enforcing = 0x0225A420,
     .off_selinux_blob_sizes = 0x015CEB88,
     .off_security_hook_heads = 0x015CE478,
     .off_slide_nfulnl_logger = 0x020129D0,
