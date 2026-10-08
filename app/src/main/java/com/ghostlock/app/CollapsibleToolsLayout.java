@@ -1,26 +1,28 @@
 package com.ghostlock.app;
 
-import android.animation.Animator;
-import android.animation.AnimatorListenerAdapter;
-import android.animation.ValueAnimator;
+import android.app.Dialog;
 import android.content.Context;
-import android.graphics.Rect;
+import android.graphics.drawable.GradientDrawable;
 import android.util.AttributeSet;
+import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
-import android.widget.ImageView;
+import android.view.Window;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 import androidx.core.content.ContextCompat;
-import androidx.core.widget.NestedScrollView;
 
-/** Expandable Tools section with theme-aware Material colors. */
+/**
+ * Tools trigger that presents the existing utility controls in a floating
+ * panel instead of expanding the Home layout inline.
+ */
 public class CollapsibleToolsLayout extends LinearLayout {
-    private View header, content;
-    private TextView title;
-    private ImageView arrow;
-    private boolean expanded = false;
-    private int scrollYBeforeExpand = -1;
+    private View header;
+    private View content;
+    private ViewGroup contentParent;
+    private ViewGroup.LayoutParams originalContentLayoutParams;
+    private int contentIndex = -1;
+    private Dialog toolsDialog;
 
     public CollapsibleToolsLayout(Context context) { super(context); setOrientation(VERTICAL); }
     public CollapsibleToolsLayout(Context context, AttributeSet attrs) { super(context, attrs); setOrientation(VERTICAL); }
@@ -29,30 +31,39 @@ public class CollapsibleToolsLayout extends LinearLayout {
     @Override protected void onFinishInflate() {
         super.onFinishInflate();
         if (getChildCount() < 2) return;
-        header = getChildAt(0); content = getChildAt(1);
-        header.setClickable(true); header.setFocusable(true); title = findFirstTextView(header);
-        if (header instanceof LinearLayout) {
-            LinearLayout row = (LinearLayout) header;
-            arrow = new ImageView(getContext());
-            arrow.setImageResource(R.drawable.ic_chevron_down);
-            arrow.setScaleType(ImageView.ScaleType.CENTER);
-            arrow.setContentDescription("Expand tools");
-            row.addView(arrow, new LinearLayout.LayoutParams(dp(48), dp(48)));
-        }
-        header.setOnClickListener(v -> toggle()); content.setVisibility(GONE); updateHeader();
+        header = getChildAt(0); content = getChildAt(1); contentParent = this; contentIndex = indexOfChild(content); originalContentLayoutParams = content.getLayoutParams();
+        header.setClickable(true); header.setFocusable(true); header.setContentDescription("Open tools"); content.setVisibility(GONE); header.setOnClickListener(v -> showToolsPanel());
     }
 
-    private TextView findFirstTextView(View v) {
-        if (v instanceof TextView) return (TextView) v;
-        if (v instanceof ViewGroup) for (int i=0;i<((ViewGroup)v).getChildCount();i++) { TextView found=findFirstTextView(((ViewGroup)v).getChildAt(i)); if(found!=null)return found; }
-        return null;
+    private void showToolsPanel() {
+        if (content == null || contentParent == null || (toolsDialog != null && toolsDialog.isShowing())) return;
+        final Dialog dialog = new Dialog(getContext()); toolsDialog = dialog;
+        LinearLayout panel = new LinearLayout(getContext()); panel.setOrientation(VERTICAL); panel.setPadding(dp(20), dp(12), dp(20), dp(16)); panel.setBackground(round(color(R.color.surface_container), 26));
+        LinearLayout handleRow = new LinearLayout(getContext()); handleRow.setGravity(Gravity.CENTER); TextView handle = new TextView(getContext()); handle.setText("—"); handle.setTextColor(color(R.color.text_secondary)); handle.setTextSize(18); handle.setGravity(Gravity.CENTER); handleRow.addView(handle, new LinearLayout.LayoutParams(dp(48), dp(24))); panel.addView(handleRow, new LinearLayout.LayoutParams(-1, dp(28)));
+        LinearLayout titleRow = new LinearLayout(getContext()); titleRow.setGravity(Gravity.CENTER_VERTICAL); TextView title = new TextView(getContext()); title.setText("Tools"); title.setTextColor(color(R.color.text_primary)); title.setTextSize(20); title.setTypeface(null, android.graphics.Typeface.BOLD); titleRow.addView(title, new LinearLayout.LayoutParams(-1, dp(48))); panel.addView(titleRow, new LinearLayout.LayoutParams(-1, dp(48)));
+
+        TextView subtitle = new TextView(getContext()); subtitle.setText("Utility actions for offsets and kernel images"); subtitle.setTextColor(color(R.color.text_secondary)); subtitle.setTextSize(12); panel.addView(subtitle, margin(-1, -2, 0, 0, 0, 14));
+        contentParent.removeView(content); content.setVisibility(VISIBLE); panel.addView(content, new LinearLayout.LayoutParams(-1, -2));
+        dialog.setOnDismissListener(d -> { GhostLockModal.clear(dialog); restoreContent(dialog, panel); }); dialog.setContentView(panel); dialog.setOnShowListener(d -> configureWindow(dialog)); dialog.show(); configureWindow(dialog);
     }
-    private void toggle(){ expanded=!expanded; if(expanded){NestedScrollView s=findParentScrollView();if(s!=null)scrollYBeforeExpand=s.getScrollY();animateExpand();}else animateCollapse(); }
-    private void animateCollapse(){ final int start=Math.max(content.getHeight(),0); ValueAnimator a=ValueAnimator.ofInt(start,0); a.addUpdateListener(x->{ViewGroup.LayoutParams p=content.getLayoutParams();p.height=(int)x.getAnimatedValue();content.setLayoutParams(p);content.setAlpha(1f-x.getAnimatedFraction());}); a.addListener(new AnimatorListenerAdapter(){@Override public void onAnimationEnd(Animator x){content.setVisibility(GONE);ViewGroup.LayoutParams p=content.getLayoutParams();p.height=ViewGroup.LayoutParams.WRAP_CONTENT;content.setLayoutParams(p);content.setAlpha(1f);restoreScrollPosition();}});a.setDuration(180).start();updateHeader(); }
-    private void animateExpand(){content.setVisibility(VISIBLE);content.measure(MeasureSpec.makeMeasureSpec(Math.max(getMeasuredWidth(),1),MeasureSpec.EXACTLY),MeasureSpec.makeMeasureSpec(0,MeasureSpec.UNSPECIFIED));final int target=content.getMeasuredHeight();final ViewGroup.LayoutParams p=content.getLayoutParams();p.height=0;content.setLayoutParams(p);content.setAlpha(0f);ValueAnimator a=ValueAnimator.ofInt(0,target);a.addUpdateListener(x->{p.height=(int)x.getAnimatedValue();content.setLayoutParams(p);content.setAlpha(x.getAnimatedFraction());});a.addListener(new AnimatorListenerAdapter(){@Override public void onAnimationEnd(Animator x){p.height=ViewGroup.LayoutParams.WRAP_CONTENT;content.setLayoutParams(p);content.setAlpha(1f);scrollExpandedToolsIntoView();}});a.setDuration(220).start();updateHeader();}
-    private void scrollExpandedToolsIntoView(){final NestedScrollView s=findParentScrollView();if(s==null)return;post(()->{Rect r=new Rect(0,0,getWidth(),getHeight());s.offsetDescendantRectToMyCoords(this,r);int top=s.getScrollY()+s.getPaddingTop(),bottom=s.getScrollY()+s.getHeight()-s.getPaddingBottom(),desired=s.getScrollY();if(r.bottom>bottom)desired+=r.bottom-bottom+dp(12);else if(r.top<top)desired-=top-r.top+dp(12);desired=Math.max(0,Math.min(desired,s.getChildAt(0).getHeight()));if(desired!=s.getScrollY())s.smoothScrollTo(0,desired);});}
-    private void restoreScrollPosition(){final NestedScrollView s=findParentScrollView();if(s==null||scrollYBeforeExpand<0)return;final int target=scrollYBeforeExpand;scrollYBeforeExpand=-1;s.post(()->s.smoothScrollTo(0,target));}
-    private NestedScrollView findParentScrollView(){android.view.ViewParent p=getParent();while(p!=null){if(p instanceof NestedScrollView)return(NestedScrollView)p;p=p.getParent();}return null;}
-    private void updateHeader(){int textColor=ContextCompat.getColor(getContext(),R.color.text_primary),iconColor=ContextCompat.getColor(getContext(),R.color.icon_tint);if(title!=null)title.setTextColor(textColor);if(arrow!=null){arrow.setColorFilter(iconColor);arrow.animate().rotation(expanded?180f:0f).setDuration(200).start();arrow.setAlpha(expanded?1f:.82f);arrow.setContentDescription(expanded?"Collapse tools":"Expand tools");}header.setContentDescription(expanded?"Collapse tools":"Expand tools");}
-    private int dp(int v){return Math.round(v*getResources().getDisplayMetrics().density);}
+
+    private void configureWindow(Dialog dialog) {
+        Window window = dialog.getWindow(); if (window == null) return;
+        window.setBackgroundDrawableResource(android.R.color.transparent); window.setDimAmount(.46f); window.addFlags(android.view.WindowManager.LayoutParams.FLAG_DIM_BEHIND); window.setGravity(Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL); window.setLayout((int) (getResources().getDisplayMetrics().widthPixels * .94f), -2);
+        GhostLockModal.apply(dialog);
+    }
+
+    private void restoreContent(Dialog dialog, ViewGroup panel) {
+        if (content != null && content.getParent() == panel) panel.removeView(content);
+        if (content != null && contentParent != null && content.getParent() == null) {
+            int index = Math.max(0, Math.min(contentIndex, contentParent.getChildCount())); ViewGroup.LayoutParams params = originalContentLayoutParams;
+            if (params != null) contentParent.addView(content, index, params); else contentParent.addView(content, index); content.setVisibility(GONE);
+        }
+        if (toolsDialog == dialog) toolsDialog = null;
+    }
+
+    private LinearLayout.LayoutParams margin(int w, int h, int l, int t, int r, int b) { LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(w, h); p.setMargins(dp(l), dp(t), dp(r), dp(b)); return p; }
+    private GradientDrawable round(int c, int r) { GradientDrawable d = new GradientDrawable(); d.setColor(c); d.setCornerRadius(dp(r)); return d; }
+    private int color(int id) { return ContextCompat.getColor(getContext(), id); }
+    private int dp(int value) { return Math.round(value * getResources().getDisplayMetrics().density); }
 }

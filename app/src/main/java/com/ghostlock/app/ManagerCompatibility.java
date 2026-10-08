@@ -5,6 +5,7 @@ import android.content.Intent;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
+import android.content.pm.ResolveInfo;
 import android.content.pm.Signature;
 import android.net.Uri;
 import android.os.Build;
@@ -30,7 +31,6 @@ public final class ManagerCompatibility {
         public final State state;
         public final ManagerInfo manager;
         Result(boolean k, State s, ManagerInfo m) { kernelSupported=k; state=s; manager=m; }
-        /** Recognized managers remain usable when their APK signature differs; spoofed is a warning state. */
         public boolean canRun() { return state == State.READY || (state == State.SPOOFED_MANAGER && manager.recognized); }
     }
 
@@ -39,10 +39,22 @@ public final class ManagerCompatibility {
         Registered(String p, String n, String u, String... c) { pkg=p; name=n; url=u; certs=c; }
     }
 
-    /* These managers are currently wired into the native ksud preparation path. */
+    /*
+     * BakaSU is the current rebrand of ReSukiSU.
+     * Official builds keep com.resukisu.resukisu, while development/PR builds
+     * may use com.resukisu.resukisu.dev or com.resukisu.resukisu.pr<number>.
+     *
+     * Package names and labels are not reliable for spoofed builds.
+     * The manager APK embeds libksud.so, so an unknown package is accepted
+     * when that native fingerprint is present.
+     */
+    private static final String RESUKISU_PACKAGE = "com.resukisu.resukisu";
+    private static final String RESUKISU_PREFIX = "com.resukisu.resukisu.";
+    private static final String BAKASU_URL = "https://github.com/Baka-SU/BakaSU";
     private static final Registered[] REGISTERED = {
+            new Registered(RESUKISU_PACKAGE, "ReSukiSU / BakaSU", BAKASU_URL),
+            new Registered("me.weishu.kernelsu.pr", "KernelSU PR", "https://github.com/tiann/KernelSU/releases"),
             new Registered("me.weishu.kernelsu", "KernelSU", "https://github.com/tiann/KernelSU/releases", "1417081413bf7ab1de8e440ecbcb62685037c8f28f048f0f8b79e305b31ab916"),
-            new Registered("com.resukisu.resukisu", "ReSukiSU", "https://github.com/ReSukiSU/ReSukiSU/releases"),
             new Registered("com.kowx712.supermanager", "KOWSU", "https://github.com/KOWX712/KernelSU/releases")
     };
 
@@ -78,8 +90,8 @@ public final class ManagerCompatibility {
             while ((line = reader.readLine()) != null) {
                 int p = line.indexOf("\"release\"");
                 if (p < 0) continue;
-                int first = line.indexOf('\"', p + 9);
-                int second = first < 0 ? -1 : line.indexOf('\"', first + 1);
+                int first = line.indexOf('"', p + 9);
+                int second = first < 0 ? -1 : line.indexOf('"', first + 1);
                 if (first >= 0 && second > first && version.equals(line.substring(first + 1, second))) return true;
             }
         } catch (Throwable ignored) {}
@@ -88,28 +100,132 @@ public final class ManagerCompatibility {
 
     public static ManagerInfo detectManager(Context context) {
         PackageManager pm = context.getPackageManager();
+
+        // First check known package IDs.
         for (Registered r : REGISTERED) {
-            try {
-                PackageInfo info = packageInfo(pm, r.pkg);
-                boolean verified = r.certs.length > 0 && hasExpectedCertificate(info, r.certs);
-                boolean spoofed = r.certs.length > 0 && !verified;
-                return new ManagerInfo(r.pkg, r.name, r.url, true, true, verified, spoofed);
-            } catch (Throwable ignored) {}
+            ApplicationInfo app = findApplication(pm, r.pkg);
+            if (app == null) continue;
+            return buildManagerInfo(pm, r.pkg, app, r);
         }
+
+        // Inspect visible launcher applications. Android 11+ filters package
+        // enumeration, while launcher queries can still expose user-facing managers.
+        try {
+            Intent launcher = new Intent(Intent.ACTION_MAIN);
+            launcher.addCategory(Intent.CATEGORY_LAUNCHER);
+            List<ResolveInfo> launchers = queryLauncherActivities(pm, launcher);
+            for (ResolveInfo info : launchers) {
+                ApplicationInfo app = info.activityInfo == null ? null : info.activityInfo.applicationInfo;
+                ManagerInfo detected = inspectCandidate(pm, app);
+                if (detected != null) return detected;
+            }
+        } catch (Throwable ignored) {}
+
+        // Fallback to installed applications for environments where launcher
+        // visibility is unavailable.
         try {
             List<ApplicationInfo> apps = pm.getInstalledApplications(PackageManager.GET_META_DATA);
             for (ApplicationInfo app : apps) {
-                if (app == null || app.packageName == null) continue;
-                String libDir = app.nativeLibraryDir == null ? "" : app.nativeLibraryDir;
-                if (new java.io.File(libDir, "libksud.so").isFile()) {
-                    CharSequence label = app.loadLabel(pm);
-                    // A library match is only a diagnostic fallback. It is not a recognized manager
-                    // and must never be treated as a spoofed/approved manager.
-                    return new ManagerInfo(app.packageName, label == null ? app.packageName : label.toString(), "", true, false, false, false);
-                }
+                ManagerInfo detected = inspectCandidate(pm, app);
+                if (detected != null) return detected;
             }
         } catch (Throwable ignored) {}
+
         return new ManagerInfo("", "", "", false, false, false, false);
+    }
+
+    private static List<ResolveInfo> queryLauncherActivities(PackageManager pm, Intent launcher) {
+        if (Build.VERSION.SDK_INT >= 33) {
+            return pm.queryIntentActivities(launcher, PackageManager.ResolveInfoFlags.of(PackageManager.MATCH_ALL));
+        }
+        return pm.queryIntentActivities(launcher, PackageManager.MATCH_ALL);
+    }
+
+    private static ManagerInfo inspectCandidate(PackageManager pm, ApplicationInfo app) {
+        if (app == null || app.packageName == null) return null;
+
+        String pkg = app.packageName;
+        String label = "";
+        try {
+            CharSequence value = app.loadLabel(pm);
+            if (value != null) label = value.toString().trim();
+        } catch (Throwable ignored) {}
+        String lowerLabel = label.toLowerCase(Locale.ROOT);
+
+        boolean resukisuFamily = pkg.equals(RESUKISU_PACKAGE) || pkg.startsWith(RESUKISU_PREFIX);
+        boolean bakaLabel = lowerLabel.contains("bakasu") || lowerLabel.contains("resukisu");
+        boolean ksud = hasKsud(app);
+
+        // Package/label identity is preferred, but libksud.so is the
+        // authoritative fingerprint for randomized/spoofed manager APKs.
+        if (!resukisuFamily && !bakaLabel && !ksud) return null;
+
+        if (resukisuFamily || bakaLabel) {
+            String name = lowerLabel.contains("bakasu") ? "BakaSU"
+                    : lowerLabel.contains("resukisu") ? "ReSukiSU"
+                    : "BakaSU / ReSukiSU";
+            return new ManagerInfo(pkg, name, BAKASU_URL, true, true, false, false);
+        }
+
+        // Unknown package + libksud.so = spoofed/repackaged BakaSU/ReSukiSU.
+        return new ManagerInfo(
+                pkg,
+                label.isEmpty() ? "BakaSU / ReSukiSU (Spoofed)" : label,
+                BAKASU_URL,
+                true,
+                true,
+                false,
+                true);
+    }
+
+    private static ManagerInfo buildManagerInfo(PackageManager pm, String pkg, ApplicationInfo app, Registered r) {
+        boolean verified = false;
+        if (r.certs.length > 0) {
+            try {
+                verified = hasExpectedCertificate(packageInfo(pm, pkg), r.certs);
+            } catch (Throwable ignored) {}
+        }
+
+        boolean spoofed = r.certs.length > 0 && !verified;
+        String displayName = resolveManagerName(pm, app, r);
+        return new ManagerInfo(
+                pkg,
+                displayName,
+                r.pkg.equals(RESUKISU_PACKAGE) ? BAKASU_URL : r.url,
+                true,
+                true,
+                verified,
+                spoofed);
+    }
+
+    private static String resolveManagerName(PackageManager pm, ApplicationInfo app, Registered registered) {
+        if (!registered.pkg.equals(RESUKISU_PACKAGE)) return registered.name;
+        try {
+            CharSequence label = app.loadLabel(pm);
+            if (label != null) {
+                String value = label.toString().trim().toLowerCase(Locale.ROOT);
+                if (value.contains("bakasu")) return "BakaSU";
+                if (value.contains("resukisu")) return "ReSukiSU";
+            }
+        } catch (Throwable ignored) {}
+        return registered.name;
+    }
+
+    private static ApplicationInfo findApplication(PackageManager pm, String pkg) {
+        try {
+            return pm.getApplicationInfo(pkg, 0);
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private static boolean hasKsud(ApplicationInfo app) {
+        String libDir = app.nativeLibraryDir;
+        if (libDir == null || libDir.isEmpty()) return false;
+        java.io.File base = new java.io.File(libDir);
+        return new java.io.File(base, "libksud.so").isFile()
+                || new java.io.File(new java.io.File(base, "arm64"), "libksud.so").isFile()
+                || new java.io.File(new java.io.File(base, "arm"), "libksud.so").isFile();
     }
 
     private static PackageInfo packageInfo(PackageManager pm, String pkg) throws PackageManager.NameNotFoundException {
@@ -140,10 +256,47 @@ public final class ManagerCompatibility {
         List<ManagerInfo> result = new ArrayList<>();
         PackageManager pm = context.getPackageManager();
         for (Registered r : REGISTERED) {
-            boolean installed = false, verified = false;
-            try { PackageInfo info = packageInfo(pm, r.pkg); installed = true; verified = r.certs.length > 0 && hasExpectedCertificate(info, r.certs); } catch (Throwable ignored) {}
-            result.add(new ManagerInfo(r.pkg, r.name, r.url, installed, true, verified, installed && r.certs.length > 0 && !verified));
+            ApplicationInfo app = findApplication(pm, r.pkg);
+            boolean installed = app != null;
+            boolean verified = false;
+            if (installed && r.certs.length > 0) {
+                try {
+                    verified = hasExpectedCertificate(packageInfo(pm, r.pkg), r.certs);
+                } catch (Throwable ignored) {}
+            }
+            String displayName = installed ? resolveManagerName(pm, app, r) : r.name;
+            String installUrl = r.pkg.equals(RESUKISU_PACKAGE) ? BAKASU_URL : r.url;
+            result.add(new ManagerInfo(r.pkg, displayName, installUrl, installed, true, verified, installed && r.certs.length > 0 && !verified));
         }
+
+        // Expose randomized/spoofed managers too.
+        try {
+            Intent launcher = new Intent(Intent.ACTION_MAIN);
+            launcher.addCategory(Intent.CATEGORY_LAUNCHER);
+            for (ResolveInfo info : queryLauncherActivities(pm, launcher)) {
+                ApplicationInfo app = info.activityInfo == null ? null : info.activityInfo.applicationInfo;
+                if (app == null || !hasKsud(app)) continue;
+                boolean alreadyKnown = false;
+                for (ManagerInfo existing : result) {
+                    if (existing.packageName.equals(app.packageName)) {
+                        alreadyKnown = true;
+                        break;
+                    }
+                }
+                if (!alreadyKnown) {
+                    CharSequence label = app.loadLabel(pm);
+                    result.add(new ManagerInfo(
+                            app.packageName,
+                            label == null ? "BakaSU / ReSukiSU (Spoofed)" : label.toString(),
+                            BAKASU_URL,
+                            true,
+                            true,
+                            false,
+                            true));
+                }
+            }
+        } catch (Throwable ignored) {}
+
         return Collections.unmodifiableList(result);
     }
 

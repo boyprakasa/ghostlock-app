@@ -94,7 +94,7 @@ public class MainActivity extends Activity {
     private static final int REQ_PICK_XBL = 1003;
     private static final String PREFS = "ghostlock_prefs";
     private static final String PREF_CPU_PAIR = "cpu_pair";
-    private static final String[] KSU_MANAGER_PACKAGES = {"me.weishu.kernelsu", "com.resukisu.resukisu", "com.kowx712.supermanager",};
+    private static final String[] KSU_MANAGER_PACKAGES = {"me.weishu.kernelsu.pr", "me.weishu.kernelsu", "com.resukisu.resukisu", "com.kowx712.supermanager",};
     private static final int COLOR_RED = 0xFFFF6B6B;
     private static final int COLOR_GREEN = 0xFF5FD68A;
     private static final int COLOR_YELLOW = 0xFFFFC94D;
@@ -107,7 +107,7 @@ public class MainActivity extends Activity {
     private final List<int[]> cpuPairs = new ArrayList<>();
     private final List<String> cpuPairLabels = new ArrayList<>();
     private final Map<View, ValueAnimator> viewAnimators = new HashMap<>();
-    private TextView deviceInfo;
+    private KernelInfoView deviceInfo;
     private TextView logView;
     private LinearLayout kernelChip;
     private TextView kernelChipText;
@@ -122,6 +122,8 @@ public class MainActivity extends Activity {
     private Button parseButton;
     private Button exportButton;
     private View rootView;
+    private DashboardStatsView dashboardStats;
+    private AnalyticsManager analytics;
     private int cpuPairIndex;
     private boolean parseWantsXbl;
 
@@ -485,6 +487,9 @@ public class MainActivity extends Activity {
         kernelChip = findViewById(R.id.kernelChip);
         kernelChipText = findViewById(R.id.kernelChipText);
         cpuSpinner = findViewById(R.id.cpuSpinner);
+        dashboardStats = findViewById(R.id.dashboardStats);
+
+        analytics = new AnalyticsManager(this);
 
         applyWindowInsetsPadding();
         deviceInfo.setText(buildDeviceSummary());
@@ -1164,13 +1169,17 @@ public class MainActivity extends Activity {
 
     /**
      * Map an extractor exit code to the user-facing failure message.
-     * 3: pselect route infeasible, 4: missing required offsets, 5: kallsyms
-     * recovery failure; -1 means the process was killed on timeout.
+     * 3: pselect route infeasible,
+     * 4: missing required offsets,
+     * 5: kallsyms recovery failure,
+     * 6: primitive already fixed,
+     * -1 means the process was killed on timeout.
      */
     private int parseFailureToast(int code) {
         return switch (code) {
             case 3, 4 -> R.string.parse_failed_route;
             case 5 -> R.string.parse_failed_kallsyms;
+            case 6 -> R.string.parse_failed_fixed;
             case -1 -> R.string.parse_timeout;
             default -> R.string.parse_failed;
         };
@@ -1220,12 +1229,52 @@ public class MainActivity extends Activity {
     }
 
     /**
-     * Sales/market name of the device, matching the language of the current region.
+     * Market name, with a MANUFACTURER/BRAND/MODEL fallback.
      */
     private String resolveDeviceName() {
-        boolean cn = "CN".equalsIgnoreCase(Locale.getDefault().getCountry());
-        String marketName = firstValidProperty(cn ? "ro.vendor.oplus.market.name" : "ro.vendor.oplus.market.enname", cn ? "ro.vendor.oplus.market.enname" : "ro.vendor.oplus.market.name", "ro.product.marketname");
-        return marketName != null ? marketName : Build.MANUFACTURER + " " + Build.MODEL;
+        String manufacturer = Build.MANUFACTURER == null ? "" : Build.MANUFACTURER.toLowerCase(Locale.ROOT);
+        String marketName;
+        switch (manufacturer) {
+            case "xiaomi":
+                marketName = firstValidProperty("ro.product.marketname");
+                break;
+            case "oppo":
+            case "oneplus":
+            case "realme":
+            case "oplus": {
+                boolean cn = "CN".equalsIgnoreCase(Locale.getDefault().getCountry());
+                marketName = firstValidProperty(
+                        cn ? "ro.vendor.oplus.market.name" : "ro.vendor.oplus.market.enname",
+                        cn ? "ro.vendor.oplus.market.enname" : "ro.vendor.oplus.market.name");
+                break;
+            }
+            case "vivo":
+                marketName = firstValidProperty("ro.vivo.market.name");
+                break;
+            case "honor":
+            case "huawei":
+                marketName = firstValidProperty("ro.config.marketing_name");
+                break;
+            case "zte":
+            case "nubia":
+                marketName = firstValidProperty("ro.vendor.product.ztename");
+                break;
+            default:
+                marketName = null;
+                break;
+        }
+        if (marketName != null) {
+            return marketName;
+        }
+        StringBuilder sb = new StringBuilder();
+        if (Build.MANUFACTURER != null) {
+            sb.append(Build.MANUFACTURER);
+        }
+        if (Build.BRAND != null && !Build.BRAND.equalsIgnoreCase(Build.MANUFACTURER)) {
+            sb.append(" ").append(Build.BRAND);
+        }
+        sb.append(" ").append(Build.MODEL);
+        return sb.toString();
     }
 
     private void startExploit() {
@@ -1278,7 +1327,17 @@ public class MainActivity extends Activity {
                 ui.post(() -> {
                     running.set(false);
                     getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-                    if (finalCode == 0) {
+
+                    // Track analytics
+                    String kernel = System.getProperty("os.version", "");
+                    String cpuPair = cpuPairLabels.get(cpuPairIndex);
+                    boolean success = finalCode == 0;
+                    String errorMsg = success ? null : "Exit code: " + finalCode;
+
+                    analytics.recordRun(success, kernel, cpuPair, errorMsg);
+                    dashboardStats.refreshStats();
+
+                    if (success) {
                         setRunState(RunState.SUCCESS);
                     } else {
                         setRunState(RunState.FAILED);
@@ -1329,7 +1388,7 @@ public class MainActivity extends Activity {
             }
         }
         if (!anyInstalled) {
-            appendLog("KernelSU/ReSukiSU app not installed");
+            appendLog("KernelSU/ReSukiSU/KowSU app not installed");
         }
         return null;
     }

